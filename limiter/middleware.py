@@ -1,52 +1,55 @@
 # middleware.py
 
-from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+import json
 import time
 
-# Configurable rate limit parameters
-MAX_TOKENS = 10
-REFILL_RATE = 1  # tokens per second
+QUEUE_NAME = "request_queue"
 
 class RateLimiterMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, redis_client):
+    def __init__(self, app, redis_client, rule_sync):
         super().__init__(app)
-        self.redis = redis_client
+        self.redis_client = redis_client
+        self.rule_sync = rule_sync  # 👈 store RuleSync instance
 
     async def dispatch(self, request: Request, call_next):
         client_ip = request.client.host
-        tokens_key = f"tokens:{client_ip}"
-        timestamp_key = f"timestamp:{client_ip}"
+        key = f"rate_limit:{client_ip}"
+        
+        # 👇 access rules safely
+        rules = self.rule_sync.rules or {}
+        rule = rules.get(client_ip) or rules.get("default")
 
-        now = time.time()
+        if not rule or "rate" not in rule or "window" not in rule:
+            rule = {"rate": 3, "window": 60}
+
+        rate_limit = rule["rate"]
+        window_size = rule["window"]
 
         try:
-            pipe = self.redis.pipeline()
-            pipe.get(tokens_key)
-            pipe.get(timestamp_key)
-            tokens_str, last_refill_str = await pipe.execute()
+            count = await self.redis_client.incr(key)
+            if count == 1:
+                await self.redis_client.expire(key, window_size)
 
-            tokens = float(tokens_str) if tokens_str else MAX_TOKENS
-            last_refill = float(last_refill_str) if last_refill_str else now
+            if count > rate_limit:
+                request_data = {
+                    "ip": client_ip,
+                    "path": request.url.path,
+                    "method": request.method,
+                    "timestamp": int(time.time())
+                }
 
-            # Refill tokens
-            elapsed = now - last_refill
-            new_tokens = min(MAX_TOKENS, tokens + elapsed * REFILL_RATE)
+                await self.redis_client.lpush(QUEUE_NAME, json.dumps(request_data))
+                print(f"⚠️ Request queued for {client_ip}")
 
-            if new_tokens >= 1:
-                new_tokens -= 1
-                pipe = self.redis.pipeline()
-                pipe.set(tokens_key, new_tokens)
-                pipe.set(timestamp_key, now)
-                await pipe.execute()
-            else:
-                return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
+                return JSONResponse(
+                    status_code=202,
+                    content={"message": "Too many requests. Your request has been queued."}
+                )
 
         except Exception as e:
             print(f"Rate limiter error: {e}")
-            # Fail open
-            pass
 
-        response = await call_next(request)
-        return response
+        return await call_next(request)

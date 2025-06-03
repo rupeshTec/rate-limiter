@@ -1,15 +1,23 @@
-# main.py
-
 from fastapi import FastAPI
-import redis.asyncio as redis
 from limiter.middleware import RateLimiterMiddleware
+from limiter.rules_sync import RuleSync
+import redis.asyncio as redis
 
 app = FastAPI()
 
 redis_client = redis.Redis(host="localhost", port=6379, db=0)
+rule_sync = RuleSync(redis_client)
 
-app.add_middleware(RateLimiterMiddleware, redis_client=redis_client)
+@app.on_event("startup")
+async def startup_event():
+    await rule_sync.start()
+
+app.add_middleware(
+    RateLimiterMiddleware,
+    redis_client=redis_client,
+    rule_sync=rule_sync
+)
 
 @app.get("/")
 async def root():
-    return {"message": "Token bucket rate limiter working!"}
+    return {"message": "Hello from distributed rate limiter"}
